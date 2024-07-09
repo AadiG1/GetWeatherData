@@ -1,0 +1,181 @@
+import requests
+import mysql.connector
+import time
+
+def get_stations_in_fips(fips_code):
+    url = f"https://www.ncdc.noaa.gov/cdo-web/api/v2/stations?locationid=FIPS:{fips_code}&limit=1000"
+    headers = {
+        "token": "IVbsYFBGSqmbgQhOJEyFTOYygpQxeirR"
+    }
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        if 'results' in data:
+            all_stations = [station['id'] for station in data['results']]
+            # Filter stations based on identifier prefix
+            filtered_stations = [station_id for station_id in all_stations if station_id.startswith('GHCND:USW')]
+            print(len(filtered_stations))
+
+            if not filtered_stations: 
+                offset = 1000
+                while True:
+                    url_with_offset = f"{url}&offset={offset}"
+                    response = requests.get(url_with_offset, headers=headers)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if 'results' in data:
+                            all_stations = [station['id'] for station in data['results']]
+                            filtered_stations = [station_id for station_id in all_stations if station_id.startswith('GHCND:USW')]
+                            
+                            if filtered_stations:
+                                print(f"Found GHCND:USW stations with offset {offset}:")
+                                print(len(filtered_stations))
+                                return filtered_stations
+                            else:
+                                print(f"No GHCND:USW stations found with offset {offset}. Trying next offset.")
+                                offset += 100  # Try next offset
+                                if offset == 2000:
+                                    break
+                        else:
+                            print("No 'results' key in API response with offset.")
+                            break
+                    else:
+                        break
+            else:
+                return filtered_stations
+    else:
+        print("Failed to retrieve station information from NOAA API.")
+        return []
+
+
+
+def get_station_info(station_id):
+    url = f"https://www.ncdc.noaa.gov/cdo-web/api/v2/stations/{station_id}"
+    headers = {
+        "token": "IVbsYFBGSqmbgQhOJEyFTOYygpQxeirR"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        latitude = data.get('latitude', None)
+        longitude = data.get('longitude', None)
+        elevation = data.get('elevation', None)
+        return latitude, longitude, elevation
+    else:
+        print("Failed to retrieve station information from NOAA API.")
+        return None, None, None
+
+def get_monthly_weather_data(station_id, start_date, end_date):
+    url = f"https://www.ncdc.noaa.gov/cdo-web/api/v2/data?datasetid=GSOM&datatypeid=TAVG,TMIN,TMAX,AWND,PRCP&startdate={start_date}&enddate={end_date}&stationid={station_id}&limit=1000"
+    headers = {
+        "token": "IVbsYFBGSqmbgQhOJEyFTOYygpQxeirR"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        if 'results' not in data:
+            #print("No results found for the specified time period and station ID.")
+            return None
+
+        #print("Data from NOAA API:")
+        monthly_data = {}
+    
+        for item in data['results']:
+            date = item['date']
+            month = date
+            datatype = item['datatype']
+            value = item['value']
+            if datatype in ('PRCP', 'AWND', 'TMAX', 'TMIN', 'TAVG'):  
+                if month not in monthly_data:
+                    monthly_data[month] = {}
+                monthly_data[month][datatype] = value
+
+        return monthly_data
+    else:
+        print(f"Failed to retrieve Weather data from NOAA API and station {station_id} ")
+        return None
+
+def insert_data_into_database(data, mycursor, station_id, fips_code):
+
+    latitude, longitude, elevation = get_station_info(station_id)
+
+    if latitude is None or longitude is None or elevation is None:
+        print("Failed to retrieve latitude, longitude, and elevation information.")
+        return
+
+    # Insert monthly weather data into the database
+    for month, values in data.items():
+        prcp = values.get('PRCP', None)
+        awnd = values.get('AWND', None)
+        tmax = values.get('TMAX', None)
+        tmin = values.get('TMIN', None)
+        tavg = values.get('TAVG', None)
+        
+        
+        # Check if the record already exists
+        sql_check = "SELECT * FROM worldmap_GlobalData WHERE station_id = %s AND Month = %s"
+        mycursor.execute(sql_check, (station_id, month))
+        result = mycursor.fetchone()
+
+        if result:
+            # Update the existing record
+            sql_update = "UPDATE worldmap_GlobalData SET PRCP = %s, AWND = %s, TMAX = %s, TMIN = %s, TAVG = %s WHERE station_id = %s AND Month = %s"
+            mycursor.execute(sql_update, (prcp, awnd, tmax, tmin, tavg, station_id, month))
+            #print(station_id, latitude, longitude, elevation, month, prcp, awnd, tmax, tmin, tavg)
+        else:
+            # Insert a new record
+            sql_insert = "INSERT INTO worldmap_GlobalData (fips_code, station_id, Latitude, Longitude, Elevation, Month, PRCP, AWND, TMAX, TMIN, TAVG) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            mycursor.execute(sql_insert, (fips_code, station_id, latitude, longitude, elevation, month, prcp, awnd, tmax, tmin, tavg))
+            #print(fips_code, station_id, latitude, longitude, elevation, month, prcp, awnd, tmax, tmin, tavg)
+
+def main():
+    fips_code = input("Enter the FIPS code: ")
+    start_date = "2014-01-01"
+    end_date = "2023-01-01"
+
+    # Connect to MySQL database
+    myDatabase = mysql.connector.connect(
+        host="mysql-db.mgmt478.geddes.rcac.purdue.edu",
+        user="admin",
+        password="admin478",
+        database="GlobalWeather"
+    )
+    mycursor = myDatabase.cursor()
+
+    # Create table if not exists
+    mycursor.execute('''CREATE TABLE IF NOT EXISTS worldmap_GlobalData (
+                            fips_code INT,
+                            station_id VARCHAR(255),
+                            Latitude FLOAT,
+                            Longitude FLOAT,
+                            Elevation FLOAT,
+                            Month VARCHAR(255),
+                            PRCP FLOAT,
+                            AWND FLOAT,
+                            TMAX FLOAT,
+                            TMIN FLOAT,
+                            TAVG FLOAT,
+                            PRIMARY KEY (station_id, Month)
+                        )''')
+    
+    
+
+    # Get stations within the FIPS code
+    stations = get_stations_in_fips(fips_code)
+
+    for station_id in stations:
+        # Get monthly weather data for each station
+        monthly_weather_data = get_monthly_weather_data(station_id, start_date, end_date)
+
+        if monthly_weather_data:
+            # Insert data into the database if it doesn't already exist
+            insert_data_into_database(monthly_weather_data, mycursor, station_id, fips_code)
+            myDatabase.commit()
+            print(f"Data for station ID {station_id} inserted into the database successfully.")
+        time.sleep(1)
+    mycursor.close()  
+
+if __name__ == "__main__":
+    main()
