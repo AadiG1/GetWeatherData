@@ -1,0 +1,130 @@
+import requests
+import mysql.connector
+import time
+
+def get_stations_in_fips(fips_code):
+    url = f"https://www.ncdc.noaa.gov/cdo-web/api/v2/stations?locationid=FIPS:{fips_code}&limit=100"
+    headers = {
+        "token": "IVbsYFBGSqmbgQhOJEyFTOYygpQxeirR"
+    }
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        if 'results' in data:
+            all_stations = [station['id'] for station in data['results']]
+            filtered_stations= [station_id for station_id in all_stations if station_id.startswith('GHCND:US1')]
+            print(len(filtered_stations))
+            
+            offset = 0
+            while True:
+                url_with_offset = f"{url}&offset={offset}"
+                response = requests.get(url_with_offset, headers=headers)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'results' in data:
+                        stations = [station['id'] for station in data['results']]
+                        filtered_stations.extend([station_id for station_id in stations if station_id.startswith('GHCND:US1')])
+                        offset += 100
+                        if len(stations) < 100:
+                            break  # Reached the end
+                    else:
+                        print("No 'results' key in API response with offset.")
+                        break
+                else:
+                    print(f"Failed to fetch stations with offset {offset}.")
+                    break
+            
+            return filtered_stations
+        else:
+            print("No 'results' key in API response.")
+    else:
+        print("Failed to retrieve station information from NOAA API.")
+        return []
+
+def get_monthly_weather_data(station_id, start_date, end_date):
+    url = f"https://www.ncdc.noaa.gov/cdo-web/api/v2/data?datasetid=GHCND&datatypeid=ACMC,ACMH,ACSC,ACSH&startdate={start_date}&enddate={end_date}&stationid={station_id}&limit=1000"
+    headers = {
+        "token": "IVbsYFBGSqmbgQhOJEyFTOYygpQxeirR"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        if 'results' not in data:
+            return None
+
+        monthly_data = {}
+    
+        for item in data['results']:
+            date = item['date']
+            month = date
+            datatype = item['datatype']
+            value = item['value']
+            if datatype in ('ACMC', 'ACMH', 'ACSC', 'ACSH'):  
+                if month not in monthly_data:
+                    monthly_data[month] = {}
+                monthly_data[month][datatype] = value
+
+        return monthly_data
+    else:
+        print(f"Failed to retrieve Weather data from NOAA API and station {station_id} ")
+        return None
+
+def insert_data_into_database(data, mycursor, station_id, fips_code):
+
+    for month, values in data.items():
+        acmc = values.get('ACMC', None)
+        acmh = values.get('ACMH', None)
+        acsc = values.get('ACSC', None)
+        acsh = values.get('ACSH', None)
+        
+        sql_check = "SELECT * FROM worldmap_GlobalData WHERE station_id = %s AND Month = %s"
+        mycursor.execute(sql_check, (station_id, month))
+        result = mycursor.fetchone()
+
+        if result:
+            sql_update = "UPDATE worldmap_GlobalData SET ACMC = %s, ACMH = %s, ACSC = %s, ACSH = %s WHERE station_id = %s AND Month = %s"
+            mycursor.execute(sql_update, (acmc, acmh, acsc, acsh, station_id, month))
+        else:
+            sql_insert = "INSERT INTO worldmap_GlobalData (fips_code, station_id, Month, ACMC, ACMH, ACSC, ACSH) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            mycursor.execute(sql_insert, (fips_code, station_id, month, acmc, acmh, acsc, acsh))
+
+def main():
+    fips_code = input("Enter the FIPS code: ")
+    start_date = "1965-05-01"
+    end_date = "1966-05-01"
+
+    myDatabase = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="Sports_12345",
+        database="myDB"
+    )
+    mycursor = myDatabase.cursor()
+
+    mycursor.execute('''CREATE TABLE IF NOT EXISTS worldmap_GlobalData (
+                            fips_code INT,
+                            station_id VARCHAR(255),
+                            Month VARCHAR(255),
+                            ACMC FLOAT,
+                            ACMH FLOAT,
+                            ACSC FLOAT,
+                            ACSH FLOAT,
+                            PRIMARY KEY (station_id, Month)
+                        )''')
+
+    stations = get_stations_in_fips(fips_code)
+
+    for station_id in stations:
+        monthly_weather_data = get_monthly_weather_data(station_id, start_date, end_date)
+
+        if monthly_weather_data:
+            insert_data_into_database(monthly_weather_data, mycursor, station_id, fips_code)
+            myDatabase.commit()
+            print(f"Data for station ID {station_id} inserted into the database successfully.")
+        time.sleep(1)
+    mycursor.close()  
+
+if __name__ == "__main__":
+    main()
